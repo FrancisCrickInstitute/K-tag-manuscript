@@ -1,0 +1,498 @@
+---
+title: "CVHH_FLASH-seq"
+author: "Amalie Grenov"
+format: html
+editor: visual
+---
+
+## CVHH FLASH-seq analysis
+
+Load R packages
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(biomaRt)
+```
+
+Create object for each plate
+
+```{r}
+read_plate <- function(n) {
+  file <- sprintf("nfCore_run/Plate%d/plate%d-results/star_rsem/rsem.merged.gene_counts.tsv", n, n)
+  data <- read.delim(file, row.names = 1)
+  as.matrix(data[, -1])
+}
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq")
+Plate1.matrix <- read_plate(1) # Plasma cells, GFP and Tom CVHH4.1g
+Plate2.matrix <- read_plate(2) #Plasma cells, GFP and Tom CVHH3.1d
+Plate3.matrix <- read_plate(3) #ABCs, GFP and Tom CVHH3.1d and CVHH4.1g
+Plate4.matrix <- read_plate(4) #BM plasma cells. GFP and Tom. CVHH4.1g and CVHH3.1d
+Plate5.matrix <- read_plate(5) #BM and Spleen plasma cells. GFP and Tom. CVHH3.1g
+
+```
+
+Initialize the Seurat objects with the raw (non-normalized data).
+
+```{r}
+make_seurat <- function(matrix, project) {
+  obj <- CreateSeuratObject(counts = matrix, project = project, min.cells = 3, min.features = 200)
+  return(obj)
+}
+
+Plate1 <- make_seurat(Plate1.matrix, "Plate1")
+Plate2 <- make_seurat(Plate2.matrix, "Plate2")
+Plate3 <- make_seurat(Plate3.matrix, "Plate3")
+Plate4 <- make_seurat(Plate4.matrix, "Plate4")
+Plate5 <- make_seurat(Plate5.matrix, "Plate5")
+
+```
+
+Generate violin plots for all plates
+
+```{r}
+# Put all matrices in a named list
+Plates <- list(Plate1, Plate2, Plate3, Plate4, Plate5)
+names(Plates) <- c("Plate1", "Plate2", "Plate3", "Plate4", "Plate5")
+
+# Generate violin plots for all plates
+vln_plots <- lapply(names(Plates), function(name) {
+  VlnPlot(Plates[[name]], features = c("nCount_RNA", "nFeature_RNA")) +
+    ggtitle(name)
+})
+
+# Combine and print all violin plots together
+wrap_plots(vln_plots)
+```
+
+# **Add mitochondrial gene counts**
+
+Retrieve Mt gene ENSMEBL identifiers from biormart
+
+```{r}
+# Get mitochondrial gene ENSEMBL IDs for mouse
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+# Check which filters exist (you can run listFilters(mart) if curious)
+# We’ll filter by chromosome name instead, since mitochondrial genes are on "MT"
+
+mt_genes <- getBM(
+  attributes = c("ensembl_gene_id", "chromosome_name"),
+  filters = "chromosome_name",
+  values = "MT",
+  mart = mart
+)$ensembl_gene_id
+
+length(mt_genes)
+head(mt_genes)
+
+```
+
+Then calculate % mitochondrial genes per Seurat object
+
+```{r}
+
+for (i in seq_along(Plates)) {
+  obj <- Plates[[i]]
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, features = mt_genes)
+  Plates[[i]] <- obj
+}
+
+# Optional: reassign back
+Plate1 <- Plates$Plate1
+Plate2 <- Plates$Plate2
+Plate3 <- Plates$Plate3
+Plate4 <- Plates$Plate4
+Plate5 <- Plates$Plate5
+```
+
+QC visualization
+
+```{r}
+wrap_plots(lapply(names(Plates), function(name) {
+  VlnPlot(Plates[[name]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt")) + ggtitle(name)
+}))
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("QC_visualization.png", plot = last_plot(), width = 20, height = 8, dpi = 300)
+```
+
+Subset Objects to include only cells with more than limit nFeature_RNA and percent_mt
+
+```{r}
+head(Plate1@meta.data)
+
+# Filter all at once
+Plates <- lapply(Plates, function(x) {
+  subset(x, subset = nFeature_RNA > 200 & percent.mt < 15)
+})
+
+# Assign back to individual objects (optional)
+Plate1 <- Plates$Plate1
+Plate2 <- Plates$Plate2
+Plate3 <- Plates$Plate3
+Plate4 <- Plates$Plate4
+Plate5 <- Plates$Plate5
+
+```
+
+### Add Meta data
+
+First Add Cellnumber column to Sample info sheet\
+NB: SeqID number corresponds to Cell# (See nfCore_run_Samplesheet_preparation.R)
+
+```{r}
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq")
+Sample_Info <- read.csv("SC24265_Sample_info3.csv")
+
+Sample_Info$cell <- paste0(
+  "cell",
+  sub(".*?(\\d{1,4})$", "\\1", Sample_Info$Sample.limsid)
+)
+
+rownames(Sample_Info) <- Sample_Info$cell
+```
+
+Add metadata for cell type and fate_map (GFP/Tomato)
+
+```{r}
+
+Plate1 <- AddMetaData(Plate1, metadata = Sample_Info)
+Plate2 <- AddMetaData(Plate2, metadata = Sample_Info)
+Plate3 <- AddMetaData(Plate3, metadata = Sample_Info)
+Plate4 <- AddMetaData(Plate4, metadata = Sample_Info)
+Plate5 <- AddMetaData(Plate5, metadata = Sample_Info)
+
+
+head(Plate2@meta.data)
+```
+
+### Add metadata for BCR alignment
+
+```{r}
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/BraCeR")
+BCR_align <- read.csv("IMGT_gapped_db_Mouse_all_reads.csv")
+
+BCR_align$cell <- paste0(
+  "cell",
+  sub(".*?(\\d{1,4})$", "\\1", BCR_align$CELL)
+)
+
+# Subset so rows with "H" in LOCUS come first
+BCR_align_H <- subset(BCR_align, grepl("H", LOCUS))
+
+head(BCR_align_H)
+
+# Count duplicates
+
+sum(duplicated(BCR_align_H$cell))
+```
+
+**remove rows where `"cell"` is duplicated and `"C_GENE"` is `"None"`**, keeping at least one of each duplicate if it has a real `C_GENE` value.
+
+```{r}
+BCR_align_H_clean <- BCR_align_H %>%
+  group_by(cell) %>%
+  filter(!(C_GENE == "None" & n() > 1)) %>%
+  ungroup()
+
+sum(duplicated(BCR_align_H_clean$cell))
+```
+
+Got it! You want to **remove rows with duplicates in `"cell"` where the `"V_EVALUE"` is the highest**, keeping the row with the lowest (best) `V_EVALUE` for each `"cell"`. Here's a clean way to do it using **`dplyr`** in R
+
+```{r}
+BCR_align_H_clean <- BCR_align_H_clean %>%
+  group_by(cell) %>%
+  slice_min(order_by = V_EVALUE, n = 1) %>%  # Keep row(s) with smallest V_EVALUE
+  ungroup() %>%
+  distinct(cell, .keep_all = TRUE)           # Remove any leftover duplicates
+sum(duplicated(BCR_align_H_clean$cell))
+```
+
+Now can asign cell to row.names
+
+```{r}
+rownames(BCR_align_H_clean) <- BCR_align_H_clean$cell
+```
+
+Add BCR_alignment data to Seurat object
+
+```{r}
+colnames(BCR_align_H_clean)
+
+#Save rownames as column
+BCR_align_H_clean <- BCR_align_H_clean %>% 
+  tibble::rownames_to_column(var = "cell_id")  # create a column with the row names
+
+BCR_H_asign <- BCR_align_H_clean %>%
+  dplyr::select(cell_id, FUNCTIONAL, V_CALL, D_CALL, J_CALL, ISOTYPE, CLONE)
+
+#convert to dataframe
+BCR_H_asign <- as.data.frame(BCR_H_asign)
+
+rownames(BCR_H_asign) <- BCR_H_asign$cell
+BCR_H_asign$cell_id <- NULL
+```
+
+Now finally add BCR data to Meta Data
+
+```{r}
+Plate1 <- AddMetaData(Plate1, metadata = BCR_H_asign)
+Plate2 <- AddMetaData(Plate2, metadata = BCR_H_asign)
+Plate3 <- AddMetaData(Plate3, metadata = BCR_H_asign)
+Plate4 <- AddMetaData(Plate4, metadata = BCR_H_asign)
+Plate5 <- AddMetaData(Plate5, metadata = BCR_H_asign)
+
+head(Plate2@meta.data)
+```
+
+### Merge objects:
+
+```{r}
+CVHHseq <- merge(x = Plate1, y = c(Plate2, Plate3, Plate4, Plate5), add.cell.ids = c("Plate1", "Plate2", "Plate3", "Plate4", "Plate5"), project = "CVHHseq")
+table(CVHHseq$orig.ident)
+VlnPlot(CVHHseq, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+```
+
+### Process reads, normalize, cluster, dimensionality reduction
+
+Normalize data
+
+First Regress out immunoglobulin genes \# NB remove also IgK and IgL genes
+
+```{r}
+
+all_genes <- getBM(
+  attributes = c("ensembl_gene_id", "external_gene_name"),
+  mart = mart
+)
+
+igh_genes <- all_genes$ensembl_gene_id[grep("^Igh", all_genes$external_gene_name)]
+igl_genes <- all_genes$ensembl_gene_id[grep("^Igl", all_genes$external_gene_name)]
+igk_genes <- all_genes$ensembl_gene_id[grep("^Igk", all_genes$external_gene_name)]
+
+length(igh_genes)
+head(igh_genes)
+
+ig_genes <- c(igh_genes, igl_genes, igk_genes)
+
+length(ig_genes)
+
+#Compute Ig score
+CVHHseq$IG_score <- PercentageFeatureSet(CVHHseq, features = ig_genes)
+```
+
+Normalize using SCT
+
+```{r}
+CVHHseq <- SCTransform(CVHHseq, vars.to.regress = "IG_score")
+
+#| echo: false
+```
+
+Run PCA - determine number of dimensions
+
+```{r}
+CVHHseq <- RunPCA(CVHHseq, features = VariableFeatures(object = CVHHseq))
+
+# Examine and visualize PCA results a few different ways
+print(CVHHseq[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(CVHHseq, dims = 1:2, reduction = "pca")
+DimPlot(CVHHseq, reduction = "pca") + NoLegend()
+DimHeatmap(CVHHseq, dims = 1:10, balanced = TRUE)
+ElbowPlot(CVHHseq)
+```
+
+Run UMAP
+
+```{r}
+CVHHseq <- FindNeighbors(CVHHseq, dims = 1:10)
+CVHHseq <- FindClusters(CVHHseq, resolution = 0.7)
+CVHHseq <- RunUMAP(CVHHseq, dims = 1:10)
+```
+
+Save RDS file
+
+```{r}
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/R_scripts")
+saveRDS(CVHHseq, file = "251024CVHHseq.rds")
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/R_scripts")
+CVHHseq <- readRDS("251024CVHHseq.rds")
+```
+
+Visualize UMAP
+
+```{r}
+My12Colours <- c('0'="#E7B4BC",'5'="#D8E9E6", '4'="#CACDDC", '3'="#F2A843", '2'="#979FC6", '11'="#EAC4AF", '10'="#5BD285", '1'="#E694A6", '9'="#979797", '6'="#7791EA", '7'="#AFE4DE", '8'="#9A3E67" )
+
+head(CVHHseq@meta.data)
+Idents(CVHHseq) <- "seurat_clusters"
+DimPlot(CVHHseq, reduction = "umap", pt.size = 2, cols = My12Colours)
+DimPlot(CVHHseq, split.by = "Cell.Type", pt.size = 2, cols = My12Colours)
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("umap.png", plot = last_plot(), width = 10, height = 8, dpi = 300)
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("umap_orig_ident.png", plot = last_plot(), width = 18, height = 8, dpi = 300)
+```
+
+Rename Seurat clusters
+
+```{r}
+# Example: rename clusters 0–3
+new.cluster.ids <- c(
+  "0" = "IgM PCs",
+  "1" = "CS PCs",
+  "2" = "IgM ABC/PCs",
+  "3" = "IgA PCs",
+  "4" = "Spleen IgM PCs",
+  "5" = "ABCs",
+  "6" = "IgD ABCs",
+  "7" = "ABC/PB",
+  "8" = "IgD ABC/PCs"
+)
+
+# Apply new names
+CVHHseq <- RenameIdents(CVHHseq, new.cluster.ids)
+```
+
+Add cell cycle score
+
+```{r}
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+CVHHseq <- CellCycleScoring(CVHHseq, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# view cell cycle scores and phase assignments
+head(combined_object[[]])
+
+DimPlot(combined_object, reduction = "umap")
+```
+
+Add ABC signature
+
+Highlight clones
+
+Each colour different, NA as gray
+
+```{r}
+
+# Define the clones you want to highlight
+highlight_clones <- c("375", "526", "652", "567")
+
+# Create a new column for plotting
+CVHHseq$clone_plot <- ifelse(CVHHseq$CLONE %in% highlight_clones, 
+                             CVHHseq$CLONE, "Other")
+
+# Define colors: one color per highlighted clone, plus gray for all others
+library(RColorBrewer)
+n_colors <- length(highlight_clones)
+colors <- c(RColorBrewer::brewer.pal(n = n_colors, name = "Set3"), "gray")  # last color is gray for "Other"
+
+
+# Manually define colors for each highlighted clone
+manual_colors <- c(
+  "375" = "#9A3E67",  # red
+  "526" = "#377EB8",  # blue
+  "652" = "#5BD285",  # green
+  "567" = "#E694A6",  # purple
+  "92" = "#7791EA",  # orange
+  "188" = "#EAC4AF",  # yellow
+  "35" = "#AFE4DE",  # brown
+  "71" = "#E7B4BC",  # pink
+  "00" = "#979FC6", # gray-ish (or pick another bright color)
+  "181" = "#66b9bd", # teal
+  "Other" = "#CACDDC"  # all other cells, including NAs
+)
+
+# Plot
+DimPlot(CVHHseq, group.by = "clone_plot", cols = colors, pt.size = 2)
+DimPlot(CVHHseq, group.by = "clone_plot", cols = manual_colors, pt.size = 2)
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("clone_plot.png", plot = last_plot(), width = 10, height = 8, dpi = 300)
+```
+
+**Colour dimplot by isotype**
+
+```{r}
+# Replace NA with "Other"
+CVHHseq$ISOTYPE <- ifelse(is.na(CVHHseq$ISOTYPE), "Other", CVHHseq$ISOTYPE)
+
+# First, ensure ISOTYPE has "None", "Other", "Unknown"
+# Move these to the front (background), others stay on top
+iso_levels <- c("None", "Other", "Unknown", 
+                setdiff(unique(CVHHseq$ISOTYPE), c("None","Other","Unknown")))
+
+CVHHseq$ISOTYPE <- factor(CVHHseq$ISOTYPE, levels = iso_levels)
+
+
+# Manually define colors for each isotype
+isotype_colors <- c(
+  "IGHA" = "lightgreen",  
+  "IGHG2B" = "#1b9e77",  
+  "IGHG2A" = "#bf5b17",
+  "IGHG3" = "#beaed4",  
+  "IGHG2C" = "#386cb0",
+  "IGHG1" = "#EAC4AF",
+  "IGHM" = "#666666", 
+  "IGHD" = "#E7B4BC", 
+  "None" = "#CACDDC", # gray-ish (or pick another bright color)
+  "Unknown" = "#CACDDC", # teal
+  "Other" = "#CACDDC"  # all other cells, including NAs
+)
+
+
+# Basic DimPlot colored by ISOTYPE
+DimPlot(CVHHseq, group.by = "ISOTYPE", pt.size = 2, cols = isotype_colors) 
+  
+
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("Isotype_umap.png", plot = last_plot(), width = 10, height = 8, dpi = 300)
+#| echo: false
+```
+
+Feature plots
+
+```{r}
+FeaturePlot(CVHHseq, features = c(""))
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000038151", pt.size = 2) # Prdm1  
+FeaturePlot(CVHHseq, features = "ENSMUSG00000067149", pt.size = 2) # Jchain
+FeaturePlot(CVHHseq, features = "ENSMUSG00000020484", pt.size = 2) # Xbp1
+FeaturePlot(CVHHseq, features = "ENSMUSG00000022496", pt.size = 2) # BCMA tnfrsf17
+FeaturePlot(CVHHseq, features = "ENSMUSG00000020592", pt.size = 2) # Sdc1
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000030789", pt.size = 2) # Itgax/Cd11c
+FeaturePlot(CVHHseq, features = "ENSMUSG00000001444", pt.size = 2) # Tbx21/T-bet
+FeaturePlot(CVHHseq, features = "ENSMUSG00000026872", pt.size = 2) # Zeb2
+FeaturePlot(CVHHseq, features = "ENSMUSG00000048031", pt.size = 2) # FCRL5
+FeaturePlot(CVHHseq, features = "ENSMUSG00000036469", pt.size = 2) # March1 
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000033306", pt.size = 2, label = T) # Lpp
+setwd("Z:/home/users/grenova/K-tag/FLASH-seq/Exported_Figures")
+ggsave("Lpp_expression.png", plot = last_plot())
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000024669", pt.size = 2) # Cd5 
+FeaturePlot(CVHHseq, features = "ENSMUSG00000005540", pt.size = 2) # Fcer2a / CD23 
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000076617", pt.size = 2) # Ighm
+FeaturePlot(CVHHseq, features = "ENSMUSG00000104213", pt.size = 2) # Ighd
+FeaturePlot(CVHHseq, features = "ENSMUSG00000076612", pt.size = 2) # Ighg2c
+FeaturePlot(CVHHseq, features = "ENSMUSG00000076613", pt.size = 2) # Ighg2b
+FeaturePlot(CVHHseq, features = "ENSMUSG00000076614", pt.size = 2) # Ighg1
+FeaturePlot(CVHHseq, features = "ENSMUSG00000095079", pt.size = 2) # Igha
+
+FeaturePlot(CVHHseq, features = c("ENSMUSG00000076617","ENSMUSG00000104213", "ENSMUSG00000076612", "ENSMUSG00000076613", "ENSMUSG00000076614", "ENSMUSG00000095079" ) , pt.size = 2) # Igha
+
+FeaturePlot(CVHHseq, features = "ENSMUSG00000020914", pt.size = 2) # Top2a
+FeaturePlot(CVHHseq, features = "ENSMUSG00000031004", pt.size = 2) # Mki67
+FeaturePlot(CVHHseq, features = "ENSMUSG00000022346", pt.size = 2) # Myc
+```
